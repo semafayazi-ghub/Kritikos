@@ -1,41 +1,44 @@
 """
-app.py  —  KRITIKOS (redesigned) prototype
-===========================================
-A working prototype of the redesigned KRITIKOS reflective assistant.
+app.py  —  KRITIKOS (redesigned, live version)
+==============================================
+A working prototype of the redesigned KRITIKOS reflective assistant, connected
+to a real AI model (via Groq) so participants can ask their own questions.
 
-WHAT IT SHOWS
-  - An AI answer (pre-written, offline, so the demo is reliable).
-  - Lightweight reflection prompts that appear UNDER the answer (embedded),
-    are OPTIONAL, and are CONTEXT-AWARE: which prompts appear is decided by a
-    small machine-learning classifier (see reflection_engine.py).
-  - The student can ignore the prompts, or tap one to reflect further.
+WHAT IT DOES
+  - The user types their OWN question and gets a real AI answer (Groq).
+  - Under the answer, KRITIKOS shows lightweight reflection prompts that are
+    OPTIONAL and CONTEXT-AWARE: which prompts appear is decided by a small
+    machine-learning classifier (see reflection_engine.py) that reads the
+    answer + its signals (citations? sources? hedging language?).
+  - The user can ignore the prompts or tap one to reflect further.
 
-HOW TO RUN
-  1. pip install streamlit scikit-learn pandas
-  2. streamlit run app.py
-  3. A browser tab opens at http://localhost:8501
+RESPONSIBLE-AI RULE
+  The model output and the classifier signal are never shown as a verdict.
+  KRITIKOS supports the user's judgement; it does not replace it.
 
-This file is the INTERFACE layer. The DATA-SCIENCE layer lives in
-reflection_engine.py. Keeping them separate makes the relationship between
-"what the model can do" and "what the interface shows" easy to explain.
+API KEY (kept secret, never in the code)
+  Locally:  create a file  .streamlit/secrets.toml  with:
+                GROQ_API_KEY = "your_key_here"
+  Online (Streamlit Cloud):  add the same secret in the app's Settings.
+
+RUN
+  pip install -r requirements.txt
+  streamlit run app.py
 """
 
 import streamlit as st
-from reflection_engine import train_model, reflect
+from groq import Groq
+from reflection_engine import train_model, classify_text, select_prompts
 
 # ---------------------------------------------------------------------------
-# Page setup
+# Page setup + light styling
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="KRITIKOS", page_icon="🦉", layout="centered")
-
-# a little styling to make the prompts look like lightweight cues
 st.markdown("""
 <style>
     .ai-answer {background:#EAF1F8; border-left:4px solid #2E6FB0;
-                padding:14px 16px; border-radius:8px; margin-bottom:8px; color:#1F3A5F;}
-    .source-box {background:#F7F9FB; border:1px solid #D7DEE7;
-                 padding:10px 14px; border-radius:8px; font-size:0.9em; color:#444;}
-    .reflect-label {color:#3F8E5C; font-size:0.85em; margin-top:6px;}
+                padding:14px 16px; border-radius:8px; margin:6px 0; color:#1F3A5F;}
+    .reflect-label {color:#3F8E5C; font-size:0.85em; margin-top:8px;}
     .data-note {color:#888; font-size:0.8em; border-top:1px solid #eee;
                 padding-top:8px; margin-top:18px;}
     .stButton>button {border-radius:18px; border:1px solid #2E6FB0; color:#2E6FB0;
@@ -44,51 +47,33 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Train the model once and cache it (so the app stays fast)
+# Train the small classifier once (cached)
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_model():
-    return train_model()  # returns (model, metrics)
+    return train_model()       # returns (model, metrics)
 
 model, metrics = get_model()
 
 # ---------------------------------------------------------------------------
-# Pre-written demo answers (offline, reliable for the video).
-# Each has the AI text + the "source" the answer leans on. The source
-# metadata is what the classifier reads to pick the right prompts.
+# Connect to Groq using the secret key
 # ---------------------------------------------------------------------------
-DEMO = {
-    "What does research say about social media and teen mental health?": {
-        "answer": ("Research suggests a link between heavy social media use and lower "
-                   "wellbeing among teenagers, especially girls, though the effect size "
-                   "is debated and many studies are correlational rather than causal."),
-        "source": {
-            "title": "Longitudinal study on adolescent social media use and wellbeing",
-            "snippet": "Peer-reviewed; reports sample, method and limitations.",
-            "source_type": "journal_article", "domain_type": "doi.org",
-            "peer_reviewed": 1, "contains_citations": 1, "uses_promotional_language": 0,
-        },
-    },
-    "How can I quickly improve my essay with AI?": {
-        "answer": ("You can paste your essay into an AI tool and ask it to rewrite weak "
-                   "paragraphs, fix grammar, and make the argument stronger in seconds."),
-        "source": {
-            "title": "10 AI hacks to finish your essay fast (sponsored)",
-            "snippet": "No sources cited; promotional language; blog post.",
-            "source_type": "ad", "domain_type": ".com",
-            "peer_reviewed": 0, "contains_citations": 0, "uses_promotional_language": 1,
-        },
-    },
-}
+def get_client():
+    key = st.secrets.get("GROQ_API_KEY", None)
+    if not key:
+        return None
+    return Groq(api_key=key)
 
-# short explanation shown when a prompt is tapped (reflection, not answers)
+client = get_client()
+
+# short reflective nudges shown when a prompt is tapped (questions, not answers)
 PROMPT_HELP = {
-    "Check the source": "Where does this claim come from? Is the source named, dated and trustworthy?",
+    "Check the source": "Where does this claim come from? Is a source named, dated and trustworthy?",
     "This may be incomplete": "This answer may leave out context or other viewpoints. What might be missing?",
-    "Compare with another source": "Try checking this against a second, independent source before you rely on it.",
-    "Verify references": "Open the cited references and confirm they actually say what the answer claims.",
+    "Compare with another source": "Try checking this against a second, independent source before relying on it.",
+    "Verify references": "If references are mentioned, open them and confirm they say what the answer claims.",
     "Compare with literature": "How does this fit with other peer-reviewed work on the topic?",
-    "Based on academic sources": "This leans on academic work — still worth checking the method and limitations.",
+    "Based on academic sources": "This sounds academic — still worth checking the method and limitations.",
 }
 
 # ---------------------------------------------------------------------------
@@ -97,53 +82,75 @@ PROMPT_HELP = {
 st.markdown("## 🦉 KRITIKOS")
 st.caption("A second look at every AI answer — reflection that supports your work, never interrupts it.")
 
-# sidebar: autonomy + transparency controls
 with st.sidebar:
     st.markdown("### Settings")
     show_reflection = st.toggle("Show reflection prompts", value=True,
-                                help="You decide. Turn this off to use the tool as a one-off.")
+                                help="You decide. Turn this off to use AI without reflection cues.")
     st.markdown("---")
     st.markdown("### About this prototype")
-    st.write("Reflection prompts are chosen by a small machine-learning model "
-             "that estimates how academic a source looks. The model never decides "
-             "for you — it only picks which optional prompts to show.")
-    st.markdown(f"**Model:** Logistic Regression  \n"
-                f"**Test accuracy:** {metrics['test_accuracy']}  \n"
-                f"**5-fold CV:** {metrics['cv_accuracy']}  \n"
-                f"**Data:** {metrics['n_samples']} synthetic examples")
-    st.caption("Synthetic data → proof of concept, not a finished system.")
+    st.write("You ask a real question and get a real AI answer. KRITIKOS then shows "
+             "optional reflection prompts. A small machine-learning model decides which "
+             "prompts to show — it never decides for you.")
+    st.markdown(f"**Reflection model:** Logistic Regression  \n"
+                f"**5-fold CV accuracy:** {metrics['cv_accuracy']}  \n"
+                f"**Trained on:** {metrics['n_samples']} synthetic examples")
+    st.caption("Synthetic training data → proof of concept, not a finished system.")
 
 # ---------------------------------------------------------------------------
-# Main interaction
+# Main interaction: user asks their own question
 # ---------------------------------------------------------------------------
-question = st.selectbox("Pick a question to ask the AI:", list(DEMO.keys()))
-item = DEMO[question]
+if client is None:
+    st.error("No AI key found. Add GROQ_API_KEY in Streamlit secrets (or .streamlit/secrets.toml) "
+             "to enable live answers.")
+    st.stop()
 
-st.markdown(f"**You asked:** {question}")
-st.markdown(f"<div class='ai-answer'>{item['answer']}</div>", unsafe_allow_html=True)
+# keep the last answer in memory so tapping a prompt doesn't re-ask the AI
+if "answer" not in st.session_state:
+    st.session_state.answer = None
+    st.session_state.tapped = None
 
-with st.expander("Source this answer leans on"):
-    s = item["source"]
-    st.markdown(f"<div class='source-box'><b>{s['title']}</b><br>{s['snippet']}<br>"
-                f"<i>type: {s['source_type']} · domain: {s['domain_type']} · "
-                f"peer-reviewed: {'yes' if s['peer_reviewed'] else 'no'}</i></div>",
-                unsafe_allow_html=True)
+question = st.text_input("Ask the AI a question:",
+                         placeholder="e.g. What does research say about social media and teen mental health?")
 
-# ---- the embedded, context-aware reflection layer ----
-if show_reflection:
-    result = reflect(model, item["source"])          # <-- model picks the prompts
-    st.markdown("<div class='reflect-label'>Reflect on this answer "
-                "(optional):</div>", unsafe_allow_html=True)
-    cols = st.columns(len(result["prompts"]))
-    for col, prompt in zip(cols, result["prompts"]):
-        if col.button(prompt, key=prompt):
-            st.session_state["tapped"] = prompt
-    if "tapped" in st.session_state and st.session_state["tapped"] in PROMPT_HELP:
-        st.info("💡 " + PROMPT_HELP[st.session_state["tapped"]])
-    st.caption(f"(internal signal: this source looks **{result['label']}** — "
-               "used only to choose which prompts appear)")
-else:
-    st.caption("Reflection prompts are off. Turn them on in the settings whenever you want them.")
+if st.button("Ask") and question.strip():
+    with st.spinner("Thinking..."):
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": question}],
+                max_tokens=400,
+            )
+            st.session_state.answer = resp.choices[0].message.content
+            st.session_state.tapped = None
+        except Exception as e:
+            st.error(f"Could not get an answer: {e}")
+            st.session_state.answer = None
+
+# show the answer + the embedded reflection layer
+if st.session_state.answer:
+    st.markdown(f"<div class='ai-answer'>{st.session_state.answer}</div>", unsafe_allow_html=True)
+
+    if show_reflection:
+        # the classifier reads the AI answer text and picks the prompts
+        prediction = classify_text(model, st.session_state.answer)
+        prompts = select_prompts(prediction)
+
+        st.markdown("<div class='reflect-label'>Reflect on this answer (optional):</div>",
+                    unsafe_allow_html=True)
+        cols = st.columns(len(prompts))
+        for col, prompt in zip(cols, prompts):
+            if col.button(prompt, key=prompt):
+                st.session_state.tapped = prompt
+
+        if st.session_state.tapped in PROMPT_HELP:
+            st.info("💡 " + PROMPT_HELP[st.session_state.tapped])
+
+        label = "academic / well-supported" if prediction == 1 else "non-academic / weaker"
+        st.caption(f"(internal signal: this answer looks **{label}** — used only to choose "
+                   "which prompts appear, never shown as a verdict)")
+    else:
+        st.caption("Reflection prompts are off. Turn them on in the settings whenever you want them.")
 
 st.markdown("<div class='data-note'>KRITIKOS does not store your chats or personal data. "
-            "Everything runs locally in this prototype.</div>", unsafe_allow_html=True)
+            "Your question is sent to the AI model only to generate an answer.</div>",
+            unsafe_allow_html=True)

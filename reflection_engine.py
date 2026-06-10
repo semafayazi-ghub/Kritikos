@@ -147,6 +147,39 @@ def classify_source(model, source: dict) -> int:
     return int(model.predict(X)[0])
 
 
+def classify_text(model, answer_text: str) -> int:
+    """Classify a free-text AI answer (used by the live app).
+
+    The model was trained on title+snippet text plus metadata. For a live AI
+    answer we do not have metadata, so we infer light signals from the text
+    itself (does it cite sources? does it hedge? does it sound promotional?)
+    and feed a single row to the same pipeline. This keeps one model and one
+    code path for both the demo and the live app.
+    """
+    txt = (answer_text or "").lower()
+    cites = int(any(k in txt for k in [
+        "study", "research", "peer-review", "journal", "et al", "(20", "according to"]))
+    promo = int(any(k in txt for k in [
+        "buy", "sponsored", "best ever", "amazing", "click here", "sign up"]))
+    hedges = any(k in txt for k in ["may", "might", "could", "debated", "uncertain", "however"])
+    row = {
+        "title": answer_text[:120],
+        "snippet": answer_text[120:360],
+        "source_type": "journal_article" if cites else "blog",
+        "domain_type": "doi.org" if cites else ".com",
+        "peer_reviewed": cites,
+        "contains_citations": cites,
+        "uses_promotional_language": promo,
+    }
+    row["text"] = f"{row['title']} . {row['snippet']}"
+    X = pd.DataFrame([row])[FEATURES]
+    pred = int(model.predict(X)[0])
+    # a hedged, non-citing answer should lean toward "weaker" prompts
+    if cites == 0 and hedges:
+        pred = 0
+    return pred
+
+
 def select_prompts(prediction: int) -> list[str]:
     """Map the internal signal to lightweight, optional reflection prompts.
 
