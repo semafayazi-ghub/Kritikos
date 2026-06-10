@@ -92,10 +92,10 @@ if HAS_LOGO:
         st.image(LOGO_PATH, width=64)
     with c2:
         st.markdown("## KRITIKOS")
-        st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
+        st.caption("A second look at every AI answer, reflection that challenges you, so you keep thinking for yourself.")
 else:
     st.markdown("## 🦉 KRITIKOS")
-    st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
+    st.caption("A second look at every AI answer, reflection that challenges you, so you keep thinking for yourself.")
 
 with st.sidebar:
     st.markdown("### Settings")
@@ -149,9 +149,11 @@ def ask_coach(history):
 
 
 # ---- 1) the AI question ----
-q = st.text_input("Ask the AI a question:",
-                  placeholder="e.g. What does research say about social media and teen mental health?")
-if st.button("Ask") and q.strip():
+with st.form("ask_form", clear_on_submit=False):
+    q = st.text_input("Ask the AI a question:",
+                      placeholder="e.g. What does research say about social media and teen mental health?")
+    submitted = st.form_submit_button("Ask")
+if submitted and q.strip():
     with st.spinner("Thinking..."):
         try:
             st.session_state.question_text = q
@@ -162,26 +164,35 @@ if st.button("Ask") and q.strip():
             st.error(f"Could not get an answer: {e}")
 
 # ---- 2) the AI answer + reflection layer ----
+def render_prompt_buttons(prompts, key_prefix):
+    """Show the reflection prompt buttons. Clicking one (re)starts a focused
+    critical dialogue on that angle. Returns True if a prompt was clicked."""
+    cols = st.columns(len(prompts))
+    clicked = False
+    for col, prompt in zip(cols, prompts):
+        if col.button(prompt, key=key_prefix + prompt):
+            st.session_state.active_prompt = prompt
+            seed = PROMPT_SEED.get(prompt, "Help me reflect on this answer.")
+            with st.spinner("KRITIKOS is thinking..."):
+                first = ask_coach([("user", seed)])
+            st.session_state.dialogue = [("kritikos", first)]
+            clicked = True
+    return clicked
+
+
 if st.session_state.answer:
     st.markdown(f"<div class='ai-answer'>{st.session_state.answer}</div>", unsafe_allow_html=True)
 
+    prediction = classify_text(model, st.session_state.answer)
+    prompts = select_prompts(prediction)
+
     if show_reflection:
-        prediction = classify_text(model, st.session_state.answer)
-        prompts = select_prompts(prediction)
         st.markdown("<div class='reflect-label'>Reflect with KRITIKOS (optional):</div>",
                     unsafe_allow_html=True)
-        cols = st.columns(len(prompts))
-        for col, prompt in zip(cols, prompts):
-            if col.button(prompt, key="p_" + prompt):
-                # start a new critical dialogue seeded by this prompt
-                st.session_state.active_prompt = prompt
-                seed = PROMPT_SEED.get(prompt, "Help me reflect on this answer.")
-                with st.spinner("KRITIKOS is thinking..."):
-                    first = ask_coach([("user", seed)])
-                st.session_state.dialogue = [("kritikos", first)]
-
+        if render_prompt_buttons(prompts, "p_"):
+            st.rerun()
         label = "academic / well-supported" if prediction == 1 else "non-academic / weaker"
-        st.caption(f"(internal signal: this answer looks **{label}** — used only to choose "
+        st.caption(f"(internal signal: this answer looks **{label}**, used only to choose "
                    "which prompts appear, never shown as a verdict)")
 
     # ---- 3) the ongoing critical dialogue ----
@@ -195,6 +206,14 @@ if st.session_state.answer:
             else:
                 with st.chat_message("user"):
                     st.write(text)
+
+        # fresh reflection prompts under the latest KRITIKOS reply, so the user
+        # can open another critical angle at any point in the conversation
+        if show_reflection:
+            st.markdown("<div class='reflect-label'>Try another angle:</div>",
+                        unsafe_allow_html=True)
+            if render_prompt_buttons(prompts, "d_"):
+                st.rerun()
 
         reply = st.chat_input("Reply to KRITIKOS...")
         if reply:
