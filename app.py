@@ -24,8 +24,18 @@ Needs a GROQ_API_KEY in Streamlit secrets (or .streamlit/secrets.toml).
 import streamlit as st
 from groq import Groq
 from reflection_engine import train_model, classify_text, select_prompts
+import os, base64
 
 st.set_page_config(page_title="KRITIKOS", page_icon="🦉", layout="centered")
+
+# load the owl logo if it is present in the repo (falls back to the emoji)
+LOGO_PATH = "kritikos_logo.png"
+HAS_LOGO = os.path.exists(LOGO_PATH)
+
+def logo_data_uri():
+    with open(LOGO_PATH, "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+
 st.markdown("""
 <style>
     .ai-answer {background:#EAF1F8; border-left:4px solid #2E6FB0;
@@ -52,6 +62,7 @@ def get_client():
 
 client = get_client()
 MODEL = "llama-3.1-8b-instant"
+OWL = LOGO_PATH if HAS_LOGO else "🦉"
 
 # The personality that makes KRITIKOS a critical coach, not an answer machine.
 COACH_SYSTEM = (
@@ -75,8 +86,16 @@ PROMPT_SEED = {
     "Based on academic sources": "This sounds academic. Push me to still check the method and limitations.",
 }
 
-st.markdown("## 🦉 KRITIKOS")
-st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
+if HAS_LOGO:
+    c1, c2 = st.columns([1, 6])
+    with c1:
+        st.image(LOGO_PATH, width=64)
+    with c2:
+        st.markdown("## KRITIKOS")
+        st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
+else:
+    st.markdown("## 🦉 KRITIKOS")
+    st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
 
 with st.sidebar:
     st.markdown("### Settings")
@@ -168,10 +187,10 @@ if st.session_state.answer:
     # ---- 3) the ongoing critical dialogue ----
     if st.session_state.dialogue:
         st.markdown("---")
-        st.markdown("#### 🦉 Reflecting on: *" + (st.session_state.active_prompt or "") + "*")
+        st.markdown("#### Reflecting on: *" + (st.session_state.active_prompt or "") + "*")
         for role, text in st.session_state.dialogue:
             if role == "kritikos":
-                with st.chat_message("assistant", avatar="🦉"):
+                with st.chat_message("assistant", avatar=OWL):
                     st.write(text)
             else:
                 with st.chat_message("user"):
