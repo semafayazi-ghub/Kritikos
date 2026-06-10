@@ -1,38 +1,30 @@
 """
-app.py  —  KRITIKOS (redesigned, live version)
-==============================================
-A working prototype of the redesigned KRITIKOS reflective assistant, connected
-to a real AI model (via Groq) so participants can ask their own questions.
+app.py  —  KRITIKOS (redesigned, interactive version)
+=====================================================
+KRITIKOS is a reflective AI companion. The user asks a normal AI question and
+gets an answer. Underneath, KRITIKOS shows context-aware reflection prompts.
+When the user taps one (e.g. "Check the source"), KRITIKOS does NOT give a
+verdict — it opens a short critical DIALOGUE: it asks probing questions,
+challenges assumptions, and helps the user think about sources and bias.
 
-WHAT IT DOES
-  - The user types their OWN question and gets a real AI answer (Groq).
-  - Under the answer, KRITIKOS shows lightweight reflection prompts that are
-    OPTIONAL and CONTEXT-AWARE: which prompts appear is decided by a small
-    machine-learning classifier (see reflection_engine.py) that reads the
-    answer + its signals (citations? sources? hedging language?).
-  - The user can ignore the prompts or tap one to reflect further.
+Two roles, one model (Groq):
+  - ANSWERER: a normal assistant that answers the user's question.
+  - KRITIKOS COACH: a Socratic guide that never gives final answers; it asks
+    questions, surfaces what to check, and pushes the user to reflect.
 
-RESPONSIBLE-AI RULE
-  The model output and the classifier signal are never shown as a verdict.
-  KRITIKOS supports the user's judgement; it does not replace it.
-
-API KEY (kept secret, never in the code)
-  Locally:  create a file  .streamlit/secrets.toml  with:
-                GROQ_API_KEY = "your_key_here"
-  Online (Streamlit Cloud):  add the same secret in the app's Settings.
+Responsible-AI rule: KRITIKOS supports the user's judgement, it does not
+replace it. The reflection classifier only decides which prompts to show.
 
 RUN
   pip install -r requirements.txt
   streamlit run app.py
+Needs a GROQ_API_KEY in Streamlit secrets (or .streamlit/secrets.toml).
 """
 
 import streamlit as st
 from groq import Groq
 from reflection_engine import train_model, classify_text, select_prompts
 
-# ---------------------------------------------------------------------------
-# Page setup + light styling
-# ---------------------------------------------------------------------------
 st.set_page_config(page_title="KRITIKOS", page_icon="🦉", layout="centered")
 st.markdown("""
 <style>
@@ -46,111 +38,153 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Train the small classifier once (cached)
-# ---------------------------------------------------------------------------
+
 @st.cache_resource
 def get_model():
-    return train_model()       # returns (model, metrics)
+    return train_model()
 
 model, metrics = get_model()
 
-# ---------------------------------------------------------------------------
-# Connect to Groq using the secret key
-# ---------------------------------------------------------------------------
+
 def get_client():
     key = st.secrets.get("GROQ_API_KEY", None)
-    if not key:
-        return None
-    return Groq(api_key=key)
+    return Groq(api_key=key) if key else None
 
 client = get_client()
+MODEL = "llama-3.1-8b-instant"
 
-# short reflective nudges shown when a prompt is tapped (questions, not answers)
-PROMPT_HELP = {
-    "Check the source": "Where does this claim come from? Is a source named, dated and trustworthy?",
-    "This may be incomplete": "This answer may leave out context or other viewpoints. What might be missing?",
-    "Compare with another source": "Try checking this against a second, independent source before relying on it.",
-    "Verify references": "If references are mentioned, open them and confirm they say what the answer claims.",
-    "Compare with literature": "How does this fit with other peer-reviewed work on the topic?",
-    "Based on academic sources": "This sounds academic — still worth checking the method and limitations.",
+# The personality that makes KRITIKOS a critical coach, not an answer machine.
+COACH_SYSTEM = (
+    "You are KRITIKOS, a critical-thinking coach for university students who use AI for "
+    "research. You NEVER give the final answer or do the work for the student. Your job is "
+    "to help them evaluate an AI answer critically. Be warm but challenging. Keep each reply "
+    "SHORT (2-4 sentences). Always end with ONE pointed question that pushes the student to "
+    "think about source quality, evidence, bias, missing perspectives, or how to verify the "
+    "claim elsewhere. When relevant, suggest concrete ways to check (e.g. look for a "
+    "peer-reviewed study, compare two sources, check the date/author), but make the student "
+    "do the checking. Never claim something is simply true or false."
+)
+
+# Each prompt seeds the dialogue with a specific critical angle.
+PROMPT_SEED = {
+    "Check the source": "I want to check where this answer comes from. Push me to think about the source quality.",
+    "This may be incomplete": "This answer may be incomplete. Help me notice what context or viewpoints might be missing.",
+    "Compare with another source": "Help me think about how to compare this with another independent source.",
+    "Verify references": "Help me think about how to verify any references or studies behind this claim.",
+    "Compare with literature": "Help me think about how this compares with peer-reviewed literature.",
+    "Based on academic sources": "This sounds academic. Push me to still check the method and limitations.",
 }
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
 st.markdown("## 🦉 KRITIKOS")
-st.caption("A second look at every AI answer — reflection that supports your work, never interrupts it.")
+st.caption("A second look at every AI answer — reflection that challenges you, without doing the thinking for you.")
 
 with st.sidebar:
     st.markdown("### Settings")
     show_reflection = st.toggle("Show reflection prompts", value=True,
-                                help="You decide. Turn this off to use AI without reflection cues.")
+                                help="You decide. Turn this off to use AI without reflection.")
+    if st.button("Start over"):
+        for k in ["answer", "question_text", "dialogue", "active_prompt"]:
+            st.session_state.pop(k, None)
+        st.rerun()
     st.markdown("---")
     st.markdown("### About this prototype")
-    st.write("You ask a real question and get a real AI answer. KRITIKOS then shows "
-             "optional reflection prompts. A small machine-learning model decides which "
-             "prompts to show — it never decides for you.")
+    st.write("Ask a real question and get a real AI answer. Tap a reflection prompt to open a "
+             "short critical dialogue with KRITIKOS. It won't give you the answer — it makes "
+             "you think. A small ML model chooses which prompts to show.")
     st.markdown(f"**Reflection model:** Logistic Regression  \n"
                 f"**5-fold CV accuracy:** {metrics['cv_accuracy']}  \n"
                 f"**Trained on:** {metrics['n_samples']} synthetic examples")
-    st.caption("Synthetic training data → proof of concept, not a finished system.")
+    st.caption("Synthetic training data → proof of concept.")
 
-# ---------------------------------------------------------------------------
-# Main interaction: user asks their own question
-# ---------------------------------------------------------------------------
 if client is None:
-    st.error("No AI key found. Add GROQ_API_KEY in Streamlit secrets (or .streamlit/secrets.toml) "
-             "to enable live answers.")
+    st.error("No AI key found. Add GROQ_API_KEY in Streamlit secrets to enable live answers.")
     st.stop()
 
-# keep the last answer in memory so tapping a prompt doesn't re-ask the AI
-if "answer" not in st.session_state:
-    st.session_state.answer = None
-    st.session_state.tapped = None
+# session state
+st.session_state.setdefault("answer", None)
+st.session_state.setdefault("question_text", "")
+st.session_state.setdefault("dialogue", [])       # list of (role, text) for the KRITIKOS chat
+st.session_state.setdefault("active_prompt", None)
 
-question = st.text_input("Ask the AI a question:",
-                         placeholder="e.g. What does research say about social media and teen mental health?")
 
-if st.button("Ask") and question.strip():
+def ask_answerer(question):
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": question}],
+        max_tokens=400,
+    )
+    return resp.choices[0].message.content
+
+
+def ask_coach(history):
+    """history = list of (role, text). Returns KRITIKOS's next critical reply."""
+    msgs = [{"role": "system", "content": COACH_SYSTEM},
+            {"role": "system", "content":
+             f"The student asked an AI: '{st.session_state.question_text}'. "
+             f"The AI answered: '{st.session_state.answer}'. "
+             "Coach the student to evaluate THIS answer critically."}]
+    for role, text in history:
+        msgs.append({"role": "user" if role == "user" else "assistant", "content": text})
+    resp = client.chat.completions.create(model=MODEL, messages=msgs, max_tokens=220)
+    return resp.choices[0].message.content
+
+
+# ---- 1) the AI question ----
+q = st.text_input("Ask the AI a question:",
+                  placeholder="e.g. What does research say about social media and teen mental health?")
+if st.button("Ask") and q.strip():
     with st.spinner("Thinking..."):
         try:
-            resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": question}],
-                max_tokens=400,
-            )
-            st.session_state.answer = resp.choices[0].message.content
-            st.session_state.tapped = None
+            st.session_state.question_text = q
+            st.session_state.answer = ask_answerer(q)
+            st.session_state.dialogue = []
+            st.session_state.active_prompt = None
         except Exception as e:
             st.error(f"Could not get an answer: {e}")
-            st.session_state.answer = None
 
-# show the answer + the embedded reflection layer
+# ---- 2) the AI answer + reflection layer ----
 if st.session_state.answer:
     st.markdown(f"<div class='ai-answer'>{st.session_state.answer}</div>", unsafe_allow_html=True)
 
     if show_reflection:
-        # the classifier reads the AI answer text and picks the prompts
         prediction = classify_text(model, st.session_state.answer)
         prompts = select_prompts(prediction)
-
-        st.markdown("<div class='reflect-label'>Reflect on this answer (optional):</div>",
+        st.markdown("<div class='reflect-label'>Reflect with KRITIKOS (optional):</div>",
                     unsafe_allow_html=True)
         cols = st.columns(len(prompts))
         for col, prompt in zip(cols, prompts):
-            if col.button(prompt, key=prompt):
-                st.session_state.tapped = prompt
-
-        if st.session_state.tapped in PROMPT_HELP:
-            st.info("💡 " + PROMPT_HELP[st.session_state.tapped])
+            if col.button(prompt, key="p_" + prompt):
+                # start a new critical dialogue seeded by this prompt
+                st.session_state.active_prompt = prompt
+                seed = PROMPT_SEED.get(prompt, "Help me reflect on this answer.")
+                with st.spinner("KRITIKOS is thinking..."):
+                    first = ask_coach([("user", seed)])
+                st.session_state.dialogue = [("kritikos", first)]
 
         label = "academic / well-supported" if prediction == 1 else "non-academic / weaker"
         st.caption(f"(internal signal: this answer looks **{label}** — used only to choose "
                    "which prompts appear, never shown as a verdict)")
-    else:
-        st.caption("Reflection prompts are off. Turn them on in the settings whenever you want them.")
+
+    # ---- 3) the ongoing critical dialogue ----
+    if st.session_state.dialogue:
+        st.markdown("---")
+        st.markdown("#### 🦉 Reflecting on: *" + (st.session_state.active_prompt or "") + "*")
+        for role, text in st.session_state.dialogue:
+            if role == "kritikos":
+                with st.chat_message("assistant", avatar="🦉"):
+                    st.write(text)
+            else:
+                with st.chat_message("user"):
+                    st.write(text)
+
+        reply = st.chat_input("Reply to KRITIKOS...")
+        if reply:
+            st.session_state.dialogue.append(("user", reply))
+            with st.spinner("KRITIKOS is thinking..."):
+                nxt = ask_coach(st.session_state.dialogue)
+            st.session_state.dialogue.append(("kritikos", nxt))
+            st.rerun()
 
 st.markdown("<div class='data-note'>KRITIKOS does not store your chats or personal data. "
-            "Your question is sent to the AI model only to generate an answer.</div>",
+            "Your messages are sent to the AI model only to generate replies.</div>",
             unsafe_allow_html=True)
