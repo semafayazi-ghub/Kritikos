@@ -1,225 +1,240 @@
 """
 reflection_engine.py
-====================
-Core data-science logic for the redesigned KRITIKOS prototype.
+=================================================================
+The "brain" behind KRITIKOS V5:
 
-This module is kept separate from the interface (app.py) on purpose, so that
-the machine-learning logic can be tested and understood on its own. It does two
-things:
+* get_ai_answer()         -> calls the hosted LLM (Groq) for the AI answer.
+* score_answer_signal()   -> the INTERNAL model signal (academic vs weak)
+                             that decides which reflection cues appear.
+                             This value is never shown to the user.
+* get_kritikos_reflection -> produces KRITIKOS's reflective reply for a
+                             cue. [V5-FIX #4] enforces ONE focused
+                             question per prompt.
 
-  1. trains a simple, interpretable classifier that estimates whether a cited
-     source looks "academic / well-supported" or "non-academic / weak";
-  2. turns that estimate into a set of lightweight reflection prompts.
+The Groq calls degrade gracefully: if no API key is configured (e.g. in a
+local demo or in CI), the functions fall back to deterministic stub text
+so the UI still runs and can be screenshotted.
 
-Design rule (responsible AI):
-  The model output is NEVER shown to the user as a verdict ("this is reliable").
-  It only selects WHICH reflection cue KRITIKOS surfaces. The user keeps the
-  final judgement. This protects the values of autonomy and calibrated trust.
-
-The dataset is small and synthetic because real HU Library data was not
-available (privacy + institutional constraints). Results are therefore a
-proof of concept, not evidence of a production-ready system.
+Author: Sema (Samaneh) Fayazi — Master Data-Driven Design (D01), HU
 """
 
 from __future__ import annotations
-import numpy as np
+
+import os
+import re
+
+# The classifier proof-of-concept lives next door; its pipeline is reused
+# so the app and the appendix share exactly one model definition.
+from kritikos_prompt_classifier import (
+    FEATURE_COLUMNS,
+    build_dataset,
+    build_model,
+    prediction_to_prompt,  # noqa: F401  (kept for parity with the appendix)
+)
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import accuracy_score
 
-RANDOM_STATE = 42
+# ----------------------------------------------------------------------
+# Reflection cues per internal signal.
+# "weak"     -> answer looks non-academic / weakly supported
+# "academic" -> answer looks academic / well-supported
+# [V5-FIX #4] three short, single-idea cues; the heavy lifting (one
+# question) happens in get_kritikos_reflection, not in the label.
+# ----------------------------------------------------------------------
+REFLECTION_CUES = {
+    "weak": ["Check the source", "This may be incomplete", "Compare with another source"],
+    "academic": ["Verify the references", "Compare with the literature", "What's the counter-view?"],
+}
 
-FEATURES = ["text", "source_type", "domain_type",
-            "peer_reviewed", "contains_citations", "uses_promotional_language"]
-
-
-# ---------------------------------------------------------------------------
-# 1. Synthetic dataset
-# ---------------------------------------------------------------------------
-def build_synthetic_dataset(n_per_class: int = 60, seed: int = RANDOM_STATE) -> pd.DataFrame:
-    """Create a small, transparent synthetic dataset of source descriptions.
-
-    label = 1 -> academic / well-supported
-    label = 0 -> non-academic / weakly supported
-    """
-    rng = np.random.default_rng(seed)
-
-    academic_titles = [
-        "A systematic review of algorithmic bias in information retrieval",
-        "Calibrated trust in automated decision systems: a longitudinal study",
-        "Peer-reviewed evidence on AI literacy interventions in higher education",
-        "Cognitive load and progressive disclosure in search interfaces",
-        "Value sensitive design for academic recommender systems",
-        "Information literacy in the age of algorithms: a meta-analysis",
-    ]
-    academic_snippets = [
-        "This peer-reviewed study reports methodology, sample size and limitations.",
-        "Results are based on a controlled experiment with 240 participants.",
-        "The article was published in a Q1 journal and is widely cited.",
-        "Findings are triangulated across qualitative and quantitative data.",
-    ]
-    nonacademic_titles = [
-        "10 study hacks that will change your life with ChatGPT",
-        "Why this one AI tool is the best ever (sponsored)",
-        "Quick blog: my opinion on using AI for essays",
-        "Top trending productivity tips you must try now",
-        "Buy our premium course to ace any exam fast",
-        "Unverified summary generated by a chatbot",
-    ]
-    nonacademic_snippets = [
-        "No sources are cited and the claims are very general.",
-        "The text uses promotional language and lacks evidence.",
-        "This is a personal opinion posted on a blog without references.",
-        "The page is an advertisement with no methodology.",
-    ]
-
-    rows = []
-    for _ in range(n_per_class):
-        rows.append({
-            "title": rng.choice(academic_titles),
-            "snippet": rng.choice(academic_snippets),
-            "source_type": rng.choice(["journal_article", "conference_paper"]),
-            "domain_type": rng.choice([".edu", ".org", "doi.org"]),
-            "peer_reviewed": 1,
-            "contains_citations": int(rng.choice([1, 1, 0])),
-            "uses_promotional_language": 0,
-            "label": 1,
-        })
-        rows.append({
-            "title": rng.choice(nonacademic_titles),
-            "snippet": rng.choice(nonacademic_snippets),
-            "source_type": rng.choice(["blog", "social_post", "ad", "chatbot_output"]),
-            "domain_type": rng.choice([".com", "medium.com", "unknown"]),
-            "peer_reviewed": 0,
-            "contains_citations": int(rng.choice([0, 0, 1])),
-            "uses_promotional_language": int(rng.choice([1, 1, 0])),
-            "label": 0,
-        })
-    df = pd.DataFrame(rows)
-    df["text"] = df["title"] + " . " + df["snippet"]
-    return df
+# ----------------------------------------------------------------------
+# Internal model signal (NEVER shown to the user — [V5-FIX #7])
+# ----------------------------------------------------------------------
+_MODEL = None
 
 
-# ---------------------------------------------------------------------------
-# 2. Model
-# ---------------------------------------------------------------------------
-def build_model() -> Pipeline:
-    """TF-IDF on text + one-hot on categoricals + numeric metadata -> LogReg."""
-    preprocessor = ColumnTransformer(transformers=[
-        ("text", TfidfVectorizer(stop_words="english", ngram_range=(1, 2)), "text"),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), ["source_type", "domain_type"]),
-        ("num", "passthrough", ["peer_reviewed", "contains_citations",
-                                "uses_promotional_language"]),
-    ])
-    return Pipeline([("pre", preprocessor),
-                     ("clf", LogisticRegression(max_iter=1000))])
+def _model():
+    """Lazily train the interpretable classifier once per process."""
+    global _MODEL
+    if _MODEL is None:
+        df = build_dataset()
+        _MODEL = build_model("logreg").fit(df[FEATURE_COLUMNS], df["label"])
+    return _MODEL
 
 
-def train_model():
-    """Train the model and return (fitted_model, metrics_dict)."""
-    df = build_synthetic_dataset()
-    X, y = df[FEATURES], df["label"]
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y)
-    model = build_model()
-    model.fit(X_tr, y_tr)
-    metrics = {
-        "test_accuracy": round(accuracy_score(y_te, model.predict(X_te)), 3),
-        "cv_accuracy": round(cross_val_score(build_model(), X, y, cv=5).mean(), 3),
-        "n_samples": len(df),
-    }
-    return model, metrics
-
-
-# ---------------------------------------------------------------------------
-# 3. From a source to reflection prompts (the design-facing part)
-# ---------------------------------------------------------------------------
-def classify_source(model, source: dict) -> int:
-    """Return 1 (academic) or 0 (non-academic) for a single source dict."""
-    row = dict(source)
-    row["text"] = f"{row.get('title','')} . {row.get('snippet','')}"
-    X = pd.DataFrame([row])[FEATURES]
-    return int(model.predict(X)[0])
-
-
-def classify_text(model, answer_text: str) -> int:
-    """Classify a free-text AI answer (used by the live app).
-
-    The model was trained on title+snippet text plus metadata. For a live AI
-    answer we do not have metadata, so we infer light signals from the text
-    itself (does it cite sources? does it hedge? does it sound promotional?)
-    and feed a single row to the same pipeline. This keeps one model and one
-    code path for both the demo and the live app.
-    """
-    txt = (answer_text or "").lower()
-    cites = int(any(k in txt for k in [
-        "study", "research", "peer-review", "journal", "et al", "(20", "according to"]))
-    promo = int(any(k in txt for k in [
-        "buy", "sponsored", "best ever", "amazing", "click here", "sign up"]))
-    hedges = any(k in txt for k in ["may", "might", "could", "debated", "uncertain", "however"])
-    row = {
-        "title": answer_text[:120],
-        "snippet": answer_text[120:360],
-        "source_type": "journal_article" if cites else "blog",
-        "domain_type": "doi.org" if cites else ".com",
-        "peer_reviewed": cites,
-        "contains_citations": cites,
+def _heuristic_metadata(answer: str) -> dict:
+    """Cheap metadata flags extracted from the answer text."""
+    lower = answer.lower()
+    cite = int(bool(re.search(r"\((19|20)\d{2}\)|doi|et al\.|journal", lower)))
+    promo = int(bool(re.search(r"\b(best ever|buy now|miracle|guaranteed|amazing)\b", lower)))
+    peer = int("peer-review" in lower or "peer reviewed" in lower)
+    return {
+        "source_type": "report" if cite else "blog",
+        "domain_type": "academic" if cite else "commercial",
+        "peer_reviewed": peer,
+        "contains_citations": cite,
         "uses_promotional_language": promo,
     }
-    row["text"] = f"{row['title']} . {row['snippet']}"
-    X = pd.DataFrame([row])[FEATURES]
-    pred = int(model.predict(X)[0])
-    # a hedged, non-citing answer should lean toward "weaker" prompts
-    if cites == 0 and hedges:
-        pred = 0
-    return pred
 
 
-def select_prompts(prediction: int) -> list[str]:
-    """Map the internal signal to lightweight, optional reflection prompts.
-
-    The wording is deliberately modest (an invitation, not a verdict).
+def score_answer_signal(question: str, answer: str) -> str:
     """
-    if prediction == 1:   # looks academic / structured
-        return ["Verify references", "Compare with literature", "Based on academic sources"]
-    return ["Check the source", "This may be incomplete", "Compare with another source"]
+    Return 'academic' or 'weak' for an AI answer. INTERNAL USE ONLY:
+    it picks which reflection cues to surface. It is logged by the app,
+    never rendered as a verdict.
+    """
+    meta = _heuristic_metadata(answer)
+    row = pd.DataFrame([{"text": f"{question} {answer[:400]}", **meta}])
+    pred = int(_model().predict(row[FEATURE_COLUMNS])[0])
+    return "academic" if pred == 1 else "weak"
 
 
-def reflect(model, source: dict) -> dict:
-    """Convenience: classify a source and return label + prompts together."""
-    pred = classify_source(model, source)
-    return {
-        "prediction": pred,
-        "label": "academic / well-supported" if pred == 1 else "non-academic / weak",
-        "prompts": select_prompts(pred),
-    }
+# ----------------------------------------------------------------------
+# LLM access (Groq) with a graceful offline fallback
+# ----------------------------------------------------------------------
+def _groq_chat(system: str, user: str, max_tokens: int = 600) -> str | None:
+    """Call Groq if configured; return None to signal 'use fallback'."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from groq import Groq  # imported lazily so the app runs without it
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=os.environ.get("KRITIKOS_MODEL", "llama-3.3-70b-versatile"),
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:  # noqa: BLE001  network/SDK issues -> graceful fallback
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Quick self-test when run directly
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    model, metrics = train_model()
-    print("Model trained.")
-    print("Metrics:", metrics)
+def get_ai_answer(question: str) -> str:
+    """Get a normal AI answer to the user's question."""
+    system = ("You are a helpful general assistant. Answer the user's "
+              "question clearly and concisely.")
+    out = _groq_chat(system, question, max_tokens=700)
+    if out:
+        return out
+    # Offline fallback (keeps the prototype demoable without a key).
+    return (
+        f"Here is a general overview in response to: “{question}”. "
+        "This is a demo answer generated without a live model key. In the "
+        "deployed app this text comes from the hosted LLM. Notice that it "
+        "does not cite a specific author, date, or publication — exactly the "
+        "kind of answer KRITIKOS invites you to look at more carefully."
+    )
 
-    examples = [
-        {"title": "Peer-reviewed study on AI literacy interventions",
-         "snippet": "Reports methodology, sample and limitations.",
-         "source_type": "journal_article", "domain_type": "doi.org",
-         "peer_reviewed": 1, "contains_citations": 1, "uses_promotional_language": 0},
-        {"title": "10 AI hacks to finish your essay fast (sponsored)",
-         "snippet": "No sources cited, promotional language.",
-         "source_type": "ad", "domain_type": ".com",
-         "peer_reviewed": 0, "contains_citations": 0, "uses_promotional_language": 1},
-    ]
-    for ex in examples:
-        out = reflect(model, ex)
-        print(f"\n{ex['title']}")
-        print(f"  -> {out['label']}")
-        print(f"  -> prompts: {out['prompts']}")
+
+# ----------------------------------------------------------------------
+# Second internal signal — claim-type detection (V5.1)
+# ----------------------------------------------------------------------
+# Besides the source-quality signal, KRITIKOS looks at WHAT KIND of claim
+# the answer makes, so the single reflective question can aim at it.
+# Same rule as the source signal: logged, NEVER shown as a verdict.
+# Marker lists are deliberately small, generic English discourse markers
+# (hedging / causal / presupposition / normative), kept visible here so
+# the criteria stay inspectable and adjustable.
+
+CLAIM_MARKERS = {
+    "causal": ["because", "leads to", "results in", "causes", "therefore",
+               "due to", "consequently", "which means", "so that"],
+    "assumption": ["obviously", "of course", "clearly", "naturally",
+                   "everyone knows", "always", "never", "simply"],
+    "value": ["should", "must", "the best", "ideally", "it is important",
+              "need to", "ought to", "better to"],
+    "surface": ["research suggests", "studies show", "often", "generally",
+                "typically", "tends to", "commonly", "in many cases"],
+}
+
+# One targeted question per claim type — exactly ONE '?' each, so the
+# single-question guarantee below is preserved.
+CLAIM_QUESTIONS = {
+    "surface": "The answer speaks in general terms — what evidence or "
+               "mechanism would make this hold in your specific case?",
+    "causal": "The answer draws a cause-and-effect link — what else could "
+              "explain that connection?",
+    "assumption": "What is this answer taking for granted — and would it "
+                  "still stand if that assumption were dropped?",
+    "value": "This answer contains a judgement about what is best — best "
+             "for whom, under which priorities?",
+}
+
+# Cues whose question is aimed at the claim rather than at the source.
+CLAIM_AWARE_CUES = {"This may be incomplete", "What's the counter-view?"}
+
+
+def detect_claim_type(answer: str) -> str:
+    """Classify the dominant claim type of an answer. INTERNAL USE ONLY."""
+    lower = answer.lower()
+    scores = {k: sum(lower.count(m) for m in v) for k, v in CLAIM_MARKERS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "surface"
+
+
+# ----------------------------------------------------------------------
+# KRITIKOS reflection — [V5-FIX #4] ONE focused question per prompt
+# ----------------------------------------------------------------------
+_ONE_QUESTION_RULE = (
+    "You are KRITIKOS, a reflective study buddy. You NEVER give the answer "
+    "and you NEVER say whether the AI is right or wrong. Your job is to make "
+    "the student look once more, on their own terms.\n"
+    "STRICT RULES:\n"
+    "1. Ask exactly ONE short question. Never stack multiple questions.\n"
+    "2. Keep it under 40 words.\n"
+    "3. Be warm and non-judgemental — a hint, not a quiz.\n"
+)
+
+# Deterministic fallbacks: each is a single, focused question. [V5-FIX #4]
+_FALLBACK = {
+    "Check the source": "Where could you confirm this — is there an original "
+        "author, date, or publication you could trace it back to?",
+    "This may be incomplete": "What's one perspective or context this answer "
+        "might be leaving out?",
+    "Compare with another source": "Which independent source could you check "
+        "to see if it says something different?",
+    "Verify the references": "Could you open one cited reference and check it "
+        "actually says what the answer claims?",
+    "Compare with the literature": "Does this match what you've read elsewhere "
+        "— or is there a study that disagrees?",
+    "What's the counter-view?": "What would someone who disagrees with this "
+        "answer point to first?",
+}
+
+
+def get_kritikos_reflection(cue: str, question: str, answer: str) -> str:
+    """Return KRITIKOS's reflective reply for a cue — one question only.
+
+    V5.1: the claim-type signal aims the question at the KIND of claim the
+    answer makes. The signal itself is internal (never rendered).
+    """
+    claim = detect_claim_type(answer)  # internal only
+    user = (
+        f"The student asked: “{question}”.\n"
+        f"The AI answered (excerpt): “{answer[:500]}”.\n"
+        f"The student tapped the reflection cue: “{cue}”.\n"
+        f"(Internal hint, never mention it: the answer reads as a {claim} claim; "
+        "aim the question at that.)\n"
+        "Respond with ONE short reflective question in that direction."
+    )
+    out = _groq_chat(_ONE_QUESTION_RULE, user, max_tokens=120)
+    if out:
+        return _enforce_single_question(out)
+    if cue in CLAIM_AWARE_CUES:                     # claim-aware offline fallback
+        return CLAIM_QUESTIONS[claim]
+    return _FALLBACK.get(cue, "What makes you confident in this answer?")
+
+
+def _enforce_single_question(text: str) -> str:
+    """
+    Safety net for [V5-FIX #4]: even if the model returns several
+    questions, keep only the first. This guarantees the UI never shows a
+    multi-question prompt (the exact issue E1 flagged in V4).
+    """
+    text = text.strip()
+    # split on '?' and keep the first question
+    if "?" in text:
+        first = text.split("?")[0].strip()
+        return first + "?"
+    return text
