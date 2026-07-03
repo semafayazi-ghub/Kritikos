@@ -1,5 +1,5 @@
 """
-KRITIKOS — V5
+KRITIKOS - V5
 =================================================================
 Embedded, context-aware reflection assistant for critical AI use.
 
@@ -30,8 +30,19 @@ V5 fixes
  #9  Privacy note surfaced near the top, not only at the bottom (P2).
  #10 Even button spacing + mobile-friendly widths (E1, E2).
 
+V5.1 fix (post-deployment, live-app user feedback)
+--------------------------------------------------
+ #11 Starter prompts now actually populate the question box. On the
+     deployed app, tapping a starter and then "Ask" produced the empty-
+     input hint: the un-keyed text_input lost its prefilled value on the
+     next rerun. The input is now a keyed widget; starters write into
+     its session state before instantiation, and the box is cleared via
+     a flag handled at the top of the run. This closes the loop on
+     [V5-FIX #3] + [V5-FIX #8], which the deployment surfaced as
+     interacting badly.
+
 Run:  streamlit run app.py
-Author: Sema (Samaneh) Fayazi — Master Data-Driven Design (D01), HU
+Author: Sema (Samaneh) Fayazi - Master Data-driven Design (D01), HU
 """
 
 from __future__ import annotations
@@ -51,13 +62,13 @@ from reflection_engine import (
 )
 
 # ----------------------------------------------------------------------
-# Logging — the internal model signal goes here, never to the screen.
+# Logging - the internal model signal goes here, never to the screen.
 # ----------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kritikos")
 
 # ----------------------------------------------------------------------
-# Logo — transparent PNG so it renders correctly on light AND dark themes.
+# Logo - transparent PNG so it renders correctly on light AND dark themes.
 # Falls back to the owl emoji if the file is missing (graceful degradation,
 # same policy as the engine).
 # ----------------------------------------------------------------------
@@ -163,7 +174,7 @@ def init_state() -> None:
 init_state()
 
 # ----------------------------------------------------------------------
-# Sidebar — settings, model card, privacy
+# Sidebar - settings, model card, privacy
 # ----------------------------------------------------------------------
 with st.sidebar:
     st.markdown("## Settings")
@@ -303,6 +314,20 @@ for i, entry in enumerate(st.session_state.history):
 # ----------------------------------------------------------------------
 # Ask box  (+ [V5-FIX #3] validation, [V5-FIX #8] starter prompts)
 # ----------------------------------------------------------------------
+# [V5.1-FIX #11] Starter prompts now write straight into the *keyed* input
+# widget's session state BEFORE the widget is instantiated. The previous
+# pop-a-"prefill"-into-value pattern broke on the very next rerun: the
+# default value flipped back to "", Streamlit treated that as a different
+# widget and reset it, so pressing "Ask" after tapping a starter raised
+# the "Please type a question first" hint even though a suggestion had
+# just been chosen. With a stable key the typed/prefilled text survives
+# every rerun, and the box is cleared through a flag that is handled
+# before the widget exists (Streamlit forbids mutating a widget's state
+# after instantiation within the same run).
+st.session_state.setdefault("question_box", "")
+if st.session_state.pop("clear_question", False):
+    st.session_state.question_box = ""
+
 with st.container(border=True):
     st.markdown("#### Ask the AI a question")
 
@@ -317,12 +342,14 @@ with st.container(border=True):
         scols = st.columns(len(starters))
         for col, s in zip(scols, starters):
             if col.button(s, key=f"starter_{s}", use_container_width=True):
-                st.session_state["prefill"] = s
+                # [V5.1-FIX #11] set the widget state directly; the button's
+                # own rerun re-creates the input with this text already in it.
+                st.session_state.question_box = s
                 st.rerun()
 
     question = st.text_input(
         "Your question",
-        value=st.session_state.pop("prefill", ""),
+        key="question_box",   # [V5.1-FIX #11] stable identity across reruns
         placeholder="e.g. What does research say about social media and teen mental health?",
         label_visibility="collapsed",
     )
@@ -342,6 +369,10 @@ if asked:
             {"q": question.strip(), "a": answer, "signal": signal}
         )
         st.session_state.active_reflection = None
+        # [V5.1-FIX #11] request a clear of the input on the next run —
+        # mutating st.session_state.question_box here would raise, because
+        # the widget has already been instantiated in this run.
+        st.session_state.clear_question = True
         st.rerun()
 
 # [V5-FIX #9] privacy line still present at the bottom too, for persistence
